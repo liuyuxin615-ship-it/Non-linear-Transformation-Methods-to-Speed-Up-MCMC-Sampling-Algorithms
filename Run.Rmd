@@ -1,0 +1,357 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+source("Sampling algorithm.r")
+source("density function.r")
+source("moment calculation and online update.r")
+source("Sinh-arcsinh transformtion.r")
+source("Skew-normal transformation.r")
+source("Johnson SU transformation.r")
+source("Online MLE update function.r")
+source("Real example.r")
+source("Comparison Function.r")
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(sn)
+library(mvtnorm)
+library(nleqslv)
+library(moments)
+library(coda)
+```
+
+# Parameter tunning
+```{r parameter tunning of incremental methods}
+library(ggplot2)
+library(coda)
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+
+compute_ess_per_sec <- function(method_name, method_fun, logpi, nits, x_curr,
+                                param_name, param_values,
+                                defaults = list(t0=2000,c=1,delta=0.7,t1=3000)) {
+  
+  res <- data.frame(param_value = numeric(), ess_per_sec = numeric())
+  
+  for (val in param_values) {
+    args <- defaults
+    args[[param_name]] <- val
+    
+    time1 <- Sys.time()
+    s <- do.call(method_fun, c(list(log_pi=logpi, nits=nits, x_curr=x_curr), args))
+    time2 <- Sys.time()
+    
+    ess <- tryCatch({
+      effectiveSize(s$samples_x)
+    }, error = function(e) NA)
+    
+    duration <- as.numeric(time2 - time1, units = "secs")
+    ess_per_sec <- ess / duration
+    
+    res <- rbind(res, data.frame(param_value = val, ess_per_sec = ifelse(is.na(ess_per_sec),0,ess_per_sec)))
+    print(res$ess_per_sec)
+  }
+  
+  res$method <- method_name
+  res$param <- param_name
+  return(res)
+}
+
+
+plot_all_ess <- function(logpi, nits=50000, x_curr=0) {
+  
+  # 6 个方法
+  methods <- list(
+    SinhArcsinh_incremental_MLE = Transformation_sinh_arcsinh_MLE,
+    SinhArcsinh_incremental_MOM = Transformation_sinh_arcsinh_mom,
+    SN_incremental_MLE = Transformation_sn_MLE,
+    SN_incremental_MOM = Transformation_sn_mom,
+    JohnsonSU_incremental_MLE = Transformation_johnsonsu_MLE,
+    JohnsonSU_incremental_MOM = Transformation_johnsonsu_mom
+  )
+  
+  # 参数范围
+  t0_values <- c(100,500,700,1000,1500,2000)
+  
+  # t1 范围区分
+  t1_values <- c(100,500,700,1000,1500,2000,3000,5000)
+  
+  results <- list()
+  
+  for (method_name in names(methods)) {
+ 
+    print(method_name)
+    method_fun <- methods[[method_name]]
+  
+    results[[paste(method_name,"t0")]] <- compute_ess_per_sec(method_name, method_fun, logpi, nits, x_curr,"t0", t0_values)
+
+
+    # if (grepl("JohnsonSU_incremental_MOM", method_name)) {
+    #   t1_values <- t1_values_short
+    # } else {
+    #   t1_values <- t1_values_long
+    # }
+    results[[paste(method_name,"t1")]] <- compute_ess_per_sec(method_name, method_fun, logpi, nits, x_curr, "t1", t1_values)
+  }
+  
+  df_all <- bind_rows(results)
+
+  df_all$method <- gsub("_incremental", "", df_all$method)
+  df_all$method <- gsub("JohnsonSU", "John", df_all$method)
+  df_all$method <- gsub("MOM", "mom", df_all$method)
+  df_all$method <- gsub("SinhArcsinh", "Sinh", df_all$method)
+  df_all$param <- gsub("t0","n0",df_all$param)
+  df_all$param <- gsub("t1","n1",df_all$param)
+  # 绘制 24 个图：facet_wrap
+ p <- ggplot(df_all, aes(x = param_value, y = ess_per_sec, color = method)) +
+  geom_line() +
+  geom_point() +
+  facet_grid(method ~ param, scales = "free", space = "fixed") +
+  labs(x = "Parameter Value", y = "ESS per second",
+       title = "ESS per second vs Parameters across Methods") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text.x = element_text(size=8),  # 列标签
+        strip.text.y = element_text(size=6))  # 行标签
+
+  p
+
+
+  return(list(data=df_all, plot=p))
+}
+
+logpi <- function(x) log_dsinh_arcsinh(x,1,1,1,1) # 你需要自己定义目标分布 log-pi
+
+res <- plot_all_ess(logpi)
+p1 <- res$plot
+data1 <- res$data
+
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+nits_values <- c(500,1000,2000,3000,4000,5000,6000,7000)
+
+# 存储结果
+results <- list()
+
+for (nits in nits_values) {
+  samples <- as.matrix(generate_sinh(nits,1,1,1,1))
+ 
+  # sinh MLE
+  sinh_mle <- Sinh_para_est_MLE(samples)
+  results <- append(results, list(data.frame(
+    nits = nits,
+    method = "Sinh_Batch_MLE",
+    param = c("xi","epsilon","eta","delta")[1:length(sinh_mle)], 
+    value = unlist(sinh_mle)
+  )))
+
+  # sinh Moment
+  sinh_mom <- fit_highdim_sinh_arcsinh(samples,"Moment")
+  results <- append(results, list(data.frame(
+    nits = nits,
+    method = "Sinh_Batch_Mom",
+    param = c("xi","epsilon","eta","delta")[1:length(sinh_mom)], 
+    value = unlist(sinh_mom)
+  )))
+
+  # Johnson SU MLE
+  johnsonsu_MLE <- fit_johnsonsu_MLE(samples)
+  results <- append(results, list(data.frame(
+    nits = nits,
+    method = "JohnsonSU_Batch_MLE",
+    param = c("gamma","delta","xi","lambda")[1:length(johnsonsu_MLE)], 
+    value = unlist(johnsonsu_MLE)
+  )))
+
+  # Johnson SU Moment
+  sample_mean <- apply(samples,2,mean)
+  sample_var <- apply(samples,2,var)
+  sample_skew <- apply(samples,2,skewness)
+  sample_kurt <- apply(samples,2,kurtosis)
+  moment_matrix <- cbind(sample_mean,sample_var,sample_skew,sample_kurt)
+  johnsonsu_mom <- fit_johnsonsu_moment(moment_matrix)
+  results <- append(results, list(data.frame(
+    nits = nits,
+    method = "JohnsonSU_Batch_Mom",
+    param = c("gamma","delta","xi","lambda")[1:length(johnsonsu_mom)], 
+    value = unlist(johnsonsu_mom)
+  )))
+
+  # SN MLE
+  sn_mle <- fit_sn_MLE(samples)
+  results <- append(results, list(data.frame(
+    nits = nits,
+    method = "SN_Batch_MLE",
+    param = c("xi","omega","alpha")[1:length(sn_mle)], 
+    value = unlist(sn_mle)
+  )))
+
+  # SN Moment
+  mu <- apply(samples,2,mean)
+  variance <- apply(samples,2,var)
+  skew <- apply(samples,2,skewness)
+  sn_mom <- fit_sn_moment(mu,variance,skew)
+  results <- append(results, list(data.frame(
+    nits = nits,
+    method = "SN_Batch_Mom",
+    param = c("xi","omega","alpha")[1:length(sn_mom)], 
+    value = unlist(sn_mom)
+  )))
+}
+
+# 合并
+df <- bind_rows(results)
+
+# 画图，每个方法单独一张图
+plots <- ggplot(df, aes(x = nits, y = value, color = param)) +
+  geom_line(size = 1) + 
+  geom_point() +
+  facet_wrap(~ method, ncol = 3, scales = "free") +
+  scale_x_continuous(
+    breaks = c(1000, 2000, 3000, 4000, 5000,6000,7000),
+    labels = c("1k", "2k", "3k", "4k", "5k","6k","7k")
+  ) +
+  labs(x = "Batch Size", y = "Parameter value") +
+  theme_minimal()+
+  theme(
+    strip.text = element_text(size = 7)      
+  )
+plots
+
+
+```
+
+# Run the example one dimension but with different skew
+```{r compare the efficiency of different algorithms at different skewness}
+library(stringr)
+# Usage example:
+epsilon_values <- c(0,0.3,0.5,0.7,1,1.5,2,2.5,3,5)
+results_normaltail <- compare_skewness_algorithms(epsilon_values)
+results_heavytail <- compare_skewness_algorithms(epsilon_values, delta_sinh = 0.5)
+results_lighttail <- compare_skewness_algorithms(epsilon_values, delta_sinh = 2)
+compare_eff <- results_normaltail2$compare_eff
+print(results_normaltail$p)
+print(results_heavytail$p)
+print(results_lighttail$p)
+
+
+```
+
+# Run the examplle high dimension at three different situations
+```{r compare the efficiency on different dimension}
+dimension_values <- c(1,2,3,5,7,10,20,30,50)
+compare_dim_mediumskew_min <- compare_dimension_algorithms(dimension_values,compare = min,epsilon_sinh = 2)
+
+compare_dim_highskew_min <- compare_dimension_algorithms(dimension_values, compare = min,epsilon_sinh = 5)
+
+compare_dim_lowskew_min <- compare_dimension_algorithms(dimension_values,compare = min,epsilon_sinh = 0.3)
+
+```
+
+# Compare the different way to find the approxiamtion distribution
+```{r total variance distance comparison}
+epsilon_values <- c(0,1,2,3,5,7,10)
+approx_normaltail_TV <- compare_TVdis_algorithms(epsilon_values,delta_sinh = 1)
+approx_heavytail_TV <- compare_TVdis_algorithms(epsilon_values,delta_sinh = 0.5)
+approx_lighttail_TV <- compare_TVdis_algorithms(epsilon_values,delta_sinh = 2)
+
+
+p1 <- approx_normaltail_TV$p + labs(title = "Total Variation Distance vs Epsilon (noraml tail)",
+                           y = "Total Variation Distance")
+p2 <- approx_heavytail_TV$p +labs(title = "Total Variation Distance vs Epsilon (heavy tail)",
+                           y = "Total Variation Distance")
+p3 <- approx_lighttail_TV$p+labs(title = "Total Variation Distance vs Epsilon (light tail)",
+                           y = "Total Variation Distance")
+p1;p2;p3
+```
+
+# Real case visualization
+```{r the visualization comparison of real case}
+# logistic case
+p_logstic1 <- realcase_visualization(logpi_logistic)
+p_logstic$p_ori+labs(title = "Contour plot of beta's posterior distribution in logistic regression  ")
+p_logstic$p_linear_trans+labs(title = "Contour plot of beta's posterior distribution in logistic regression  \n after linear transformation")
+p_logstic$p_john
+p_logstic$p_sn 
+p_logstic$p_sinh 
+
+# Neal funnel
+p_funnel <- realcase_visualization(log_funnel,var1 = "X2",var2 = "X1")
+p_funnel$p_ori
+p_funnel$p_linear_trans
+p_funnel$p_john
+p_funnel$p_sn 
+p_funnel$p_sinh 
+
+# Rosenbrock
+p_rosen1 <- realcase_visualization(log_rosenbrock,var1 = "X1",var2 = "X2")
+p_rosen1$p_ori
+p_rosen1$p_linear_trans
+p_rosen1$p_john
+p_rosen1$p_sn 
+p_rosen1$p_sinh 
+```
+
+# Efficiency comparison on real examples
+```{r experiment in real examples}
+dimension_values <- c(2,5,7,10,15,20)
+eff_matrix  = as.data.frame(matrix(0,ncol = 6,nrow = length(dimension_values)))
+colnames(eff_matrix) <- c("dimension","MALA","RWM","SN","Johnson","Sinh")
+eff_matrix$dimension <- dimension_values
+eff_logistic = eff_funel = eff_matrix
+for(i in 1: length(dimension_values)){
+  cat("iteration",i)
+  d <- dimension_values[i]
+  set.seed(4231)
+  # True parameter values
+  beta <- c(-5,rep((3.3-0.15*d),d-1))
+  # Number of observations
+  n_logistic_highdim <- 1000
+  # Generate covariates
+  x_logistic_highdim <- cbind(rep(1,n_logistic_highdim), 
+                              rmvnorm(n_logistic_highdim, mean =rep(-1.5,(d-1)),sigma = diag((d-1))))
+  
+  # Create success probabilities
+  p_logistic_highdim <- exp(x_logistic_highdim %*% beta)/(1+exp(x_logistic_highdim %*% beta))
+  # Generate y values
+  y_logistic_highdim = 0
+  while(mean(y_logistic_highdim)!=0.001){
+  y_logistic_highdim <- rbinom(n_logistic_highdim, size = 1, prob = p_logistic_highdim)
+  }
+  print(mean(y_logistic_highdim))# when the mean is around 0.001 the posterior is pretty skew
+  # Create posterior
+  logpi_logistic_highdim <- function(beta) {
+    logprior <- dmvnorm(beta,mean = rep(0,d),sigma = 100* diag(d),log = T)
+    p <- 1/(1+exp( -x_logistic_highdim %*% beta))
+    loglik <- sum(dbinom(y_logistic_highdim, size = 1, prob = p, log = T))
+    logpi <- pmin(loglik + logprior,1e30)
+    return(pmax(logpi,-1e300))
+  }
+  
+  d_logpi_logistic_highdim <- function(beta){
+    term1 <- exp(-x_logistic_highdim %*% beta)
+    term2 <- exp(x_logistic_highdim %*% beta)
+    grad <- -beta/100 + t(x_logistic_highdim)%*% (y_logistic_highdim*(term1/(1+ term1))) -
+      t(x_logistic_highdim)%*%((1-y_logistic_highdim)*(term2/(1+term2)))
+    return(grad)
+  }
+  eff_matrix_logistic_highdim <- compare_efficiecny(logpi_logistic_highdim,d_logpi_logistic_highdim,dimension = d,nits = 50000,pre_nits = 5000,n_rep = 3)
+  eff_logistic[i,2:6] <-  colMeans(eff_matrix_logistic_highdim$eff_matrix)
+  eff_matrix_funnel_highdim <-  compare_efficiecny(log_funnel_highdim ,d_log_funnel_highdim,dimension = d,nits = 50000,pre_nits = 5000,n_rep = 1)
+  eff_funel[i,2:6] <- colMeans(eff_matrix_funnel_highdim$eff_matrix)
+
+}
+eff_rosenbrock = compare_efficiecny(log_rosenbrock,d_log_rosenbrock,nits = 50000,pre_nits = 5000,n_rep = 3)$eff_matrix
+eff_logistic
+eff_funel
+eff_rosenbrock
+```
